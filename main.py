@@ -174,14 +174,7 @@ async def restore():
 class Bot(discord.Client):
     def __init__(s):
         super().__init__(intents=discord.Intents.default()); s.tree = app_commands.CommandTree(s)
-    async def setup_hook(s):
-        global http
-        http = aiohttp.ClientSession()
-        app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health)])
-        rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
-        print(f"API licencji: port {PORT}")
-        await restore(); asyncio.create_task(backup_loop())
-        await s.tree.sync()
+    async def setup_hook(s): await s.tree.sync()
 bot = Bot()
 key = app_commands.Group(name="key", description="Zarządzanie kluczami licencyjnymi", default_permissions=discord.Permissions(administrator=True))
 bot.tree.add_command(key)
@@ -278,6 +271,21 @@ async def k_import(i: discord.Interaction):
         await i.followup.send(f"✅ Zaimportowano {n} kluczy.", ephemeral=True)
     except Exception as ex: await i.followup.send(f"❌ Błąd importu: {ex}", ephemeral=True)
 
+async def main():
+    global http
+    http = aiohttp.ClientSession()
+    await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
+    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health)])
+    rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
+    print(f"API licencji: port {PORT}")
+    asyncio.create_task(backup_loop())
+    try: await bot.start(TOKEN)
+    except discord.HTTPException as e:
+        if e.status != 429: raise
+        print("Discord 429 (limit IP hostingu) - ponowna proba za 15 min; API licencji dziala dalej")
+        await asyncio.sleep(900)
+        import sys; os.execv(sys.executable, [sys.executable] + sys.argv)
+
 if __name__ == "__main__":
     if not TOKEN: raise SystemExit("Brak DISCORD_TOKEN w .env")
-    bot.run(TOKEN)
+    asyncio.run(main())
