@@ -272,12 +272,67 @@ async def k_import(i: discord.Interaction):
         await i.followup.send(f"✅ Zaimportowano {n} kluczy.", ephemeral=True)
     except Exception as ex: await i.followup.send(f"❌ Błąd importu: {ex}", ephemeral=True)
 
+# ---------------------------------------------------------------- panel WWW (dziala bez Discorda): /admin
+import html as _h
+ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "")
+CSRF = secrets.token_hex(16)
+def _authed(req):
+    try:
+        u, p = base64.b64decode(req.headers.get("Authorization", "")[6:]).decode().split(":", 1)
+        return bool(ADMIN_PASS) and secrets.compare_digest(p, ADMIN_PASS)
+    except Exception: return False
+def _deny(): return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="Aver"'}, text="Brak dostepu")
+async def admin_page(req):
+    if not _authed(req): return _deny()
+    msg = _h.escape(req.query.get("m", ""))
+    rows = ""
+    for r in q("SELECT * FROM keys ORDER BY created DESC LIMIT 300"):
+        st = "BAN" if r["banned"] else ("nieaktywny" if not r["activated"] else ("wygasl" if r["expires"] and now() >= r["expires"] else "aktywny"))
+        exp = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["expires"] / 1000)) if r["expires"] else ("lifetime" if r["activated"] else "-")
+        k = _h.escape(r["key"])
+        def f(a, label, extra=""): return f'<form method=post action="/admin/act" style="display:inline"><input type=hidden name=csrf value="{CSRF}"><input type=hidden name=key value="{k}"><button name=a value={a}>{label}</button>{extra}</form>'
+        rows += (f"<tr><td><code>{k}</code></td><td>{_h.escape(r['type'])}</td><td>{st}</td><td>{exp}</td><td>{_h.escape(r['last_name'] or '-')}</td><td>{_h.escape(r['note'] or '')}</td><td>"
+                 + f("unban" if r["banned"] else "ban", "Odbanuj" if r["banned"] else "Banuj", '' if r["banned"] else ' <input name=arg placeholder=powod size=10>')
+                 + f("extend", "+czas", ' <input name=arg placeholder=7d size=4>') + f("resethwid", "Reset HWID") + f("delete", "Usun") + "</td></tr>")
+    page = f"""<!doctype html><meta charset=utf-8><title>Aver panel</title><style>body{{font:14px system-ui;background:#0b0b0d;color:#eee;padding:20px}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #222;padding:6px;text-align:left}}button,input{{background:#1b1b20;color:#eee;border:1px solid #333;border-radius:6px;padding:4px 8px}}code{{color:#6cb6ff}}</style>
+<h2>Aver - klucze</h2><p style=color:#3dd68c>{msg}</p>
+<form method=post action="/admin/act"><input type=hidden name=csrf value="{CSRF}"><input type=hidden name=a value=create>
+Czas <input name=arg value=30d size=8> Ilosc <input name=count value=1 size=3 type=number min=1 max=25> Notatka <input name=note> <button>Generuj klucze</button></form><br>
+<table><tr><th>Klucz<th>Typ<th>Status<th>Wygasa<th>Nick<th>Notatka<th>Akcje</tr>{rows}</table>"""
+    return web.Response(text=page, content_type="text/html")
+async def admin_act(req):
+    if not _authed(req): return _deny()
+    d = await req.post()
+    if d.get("csrf") != CSRF: return web.Response(status=403, text="csrf")
+    a, key, arg = d.get("a", ""), str(d.get("key", "")).strip().upper(), str(d.get("arg", "")).strip()
+    m = "OK"
+    if a == "create":
+        if dur_ms(arg) is None: m = "Zly czas (np. 7d, 30d, lifetime)"
+        else:
+            ks = []
+            for _ in range(max(1, min(25, int(d.get("count", 1) or 1)))):
+                k = new_key(); run("INSERT INTO keys(key,type,created,note) VALUES(?,?,?,?)", k, arg.lower(), now(), str(d.get("note", ""))[:100]); ks.append(k)
+            m = "Utworzono: " + " ".join(ks)
+    else:
+        r = get(key)
+        if not r: m = "Nie ma takiego klucza"
+        elif a == "ban": run("UPDATE keys SET banned=1, reason=? WHERE key=?", arg[:150], key); m = "Zbanowano " + key
+        elif a == "unban": run("UPDATE keys SET banned=0, reason='' WHERE key=?", key); m = "Odbanowano " + key
+        elif a == "resethwid": run("UPDATE keys SET hwid='' WHERE key=?", key); m = "Zresetowano HWID " + key
+        elif a == "delete": run("DELETE FROM keys WHERE key=?", key); m = "Usunieto " + key
+        elif a == "extend":
+            dm = dur_ms(arg)
+            if not dm: m = "Zly czas (np. 7d)"
+            elif not r["activated"] or not r["expires"]: m = "Klucz nieaktywowany lub lifetime"
+            else: run("UPDATE keys SET expires=? WHERE key=?", max(r["expires"], now()) + dm, key); m = "Przedluzono " + key
+    raise web.HTTPSeeOther("/admin?m=" + __import__("urllib.parse").parse.quote(m))
+
 async def main():
     global http
     discord.utils.setup_logging()
     http = aiohttp.ClientSession()
     await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
-    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health)])
+    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
     rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
     print(f"API licencji: port {PORT}", flush=True)
     asyncio.create_task(backup_loop())
