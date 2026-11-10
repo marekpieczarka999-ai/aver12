@@ -175,6 +175,7 @@ class Bot(discord.Client):
     def __init__(s):
         super().__init__(intents=discord.Intents.default()); s.tree = app_commands.CommandTree(s)
     async def setup_hook(s): await s.tree.sync()
+    async def on_ready(s): print(f"Bot zalogowany jako {s.user}", flush=True)
 bot = Bot()
 key = app_commands.Group(name="key", description="Zarządzanie kluczami licencyjnymi", default_permissions=discord.Permissions(administrator=True))
 bot.tree.add_command(key)
@@ -273,16 +274,17 @@ async def k_import(i: discord.Interaction):
 
 async def main():
     global http
+    discord.utils.setup_logging()
     http = aiohttp.ClientSession()
     await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
     app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health)])
     rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
-    print(f"API licencji: port {PORT}")
+    print(f"API licencji: port {PORT}", flush=True)
     asyncio.create_task(backup_loop())
     try: await bot.start(TOKEN)
     except discord.HTTPException as e:
         if e.status != 429: raise
-        print("Discord 429 (limit IP hostingu) - ponowna proba za 15 min; API licencji dziala dalej")
+        print("Discord 429 (limit IP hostingu) - ponowna proba za 15 min; API licencji dziala dalej", flush=True)
         await asyncio.sleep(900)
         import sys; os.execv(sys.executable, [sys.executable] + sys.argv)
 
