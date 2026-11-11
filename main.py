@@ -24,7 +24,8 @@ TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
 BASE = os.path.dirname(os.path.abspath(__file__))
 _pem = os.getenv("LICENSE_PRIVATE_KEY", "").replace("\\n", "\n").encode() or open(os.path.join(BASE, "license_private.pem"), "rb").read()   # na Renderze: klucz w zmiennej srodowiskowej, nie w repo
 PRIV = serialization.load_pem_private_key(_pem, None)
-BK_ID = os.getenv("JSONBIN_BACKUP_ID", "")   # osobny bin na kopie bazy (dysk Rendera free jest tymczasowy)
+BK_ID = os.getenv("JSONBIN_BACKUP_ID", "")
+if BK_ID and BK_ID == JB_ID: print("UWAGA: JSONBIN_BACKUP_ID = JSONBIN_BIN_ID - kopia zapasowa wylaczona, zeby nie nadpisac starych kluczy", flush=True); BK_ID = ""   # osobny bin na kopie bazy (dysk Rendera free jest tymczasowy)
 ACCENT, RED, GREEN, ORANGE = 0x6CB6FF, 0xE5484D, 0x3DD68C, 0xFFB224
 
 # ---------------------------------------------------------------- baza
@@ -157,7 +158,7 @@ async def backup_loop():
     while BK_ID and JB_KEY:
         await asyncio.sleep(60)
         rows = _rows(); snap = json.dumps(rows, sort_keys=True)
-        if snap == last: continue
+        if not rows or snap == last: continue   # pusta baza nigdy nie nadpisuje kopii
         try:
             async with http.put(f"https://api.jsonbin.io/v3/b/{BK_ID}", json={"keys": rows}, headers={"X-Master-Key": JB_KEY}, timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status == 200: last = snap
@@ -263,13 +264,17 @@ async def k_import(i: discord.Interaction):
             data = await r.json(content_type=None)
             if r.status != 200: return await i.followup.send(f"❌ JSONBin: HTTP {r.status}", ephemeral=True)
         n = 0
-        for e in (data.get("record", data).get("keys") or []):
+        lst = data.get("record", data) if isinstance(data, dict) else data
+        lst = lst.get("keys") if isinstance(lst, dict) else lst
+        lst = lst or []
+        for e in lst:
+            if not isinstance(e, dict): continue
             k = str(e.get("key", "")).strip().upper()
             if not k or get(k): continue
             off = e.get("active") is False
             run("INSERT INTO keys(key,type,hwid,created,activated,expires,banned,reason) VALUES(?,?,?,?,?,?,?,?)", k, LEGACY.get(str(e.get("type", "lifetime")), str(e.get("type", "lifetime"))),
                 str(e.get("hwid") or ""), now(), iso_ms(e.get("activated_at")), iso_ms(e.get("expires_at")), 1 if (e.get("banned") or off) else 0, str(e.get("ban_reason") or ("dezaktywowany" if off else ""))[:150]); n += 1
-        await i.followup.send(f"✅ Zaimportowano {n} kluczy.", ephemeral=True)
+        await i.followup.send(f"✅ Zaimportowano {n} kluczy (w binie znaleziono wpisów: {len(lst)}; reszta już była w bazie).", ephemeral=True)
     except Exception as ex: await i.followup.send(f"❌ Błąd importu: {ex}", ephemeral=True)
 
 # ---------------------------------------------------------------- panel WWW (dziala bez Discorda): /admin
