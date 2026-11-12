@@ -33,6 +33,7 @@ db = sqlite3.connect(os.getenv("DB_PATH") or os.path.join(BASE, "licenses.db"), 
 db.row_factory = sqlite3.Row
 db.execute("""CREATE TABLE IF NOT EXISTS keys(key TEXT PRIMARY KEY, type TEXT, hwid TEXT DEFAULT '', created INT, activated INT DEFAULT 0,
   expires INT DEFAULT 0, banned INT DEFAULT 0, reason TEXT DEFAULT '', note TEXT DEFAULT '', last_ip TEXT DEFAULT '', last_seen INT DEFAULT 0, last_name TEXT DEFAULT '')""")
+db.execute("CREATE TABLE IF NOT EXISTS cmds(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, type TEXT, arg TEXT DEFAULT '', created INT)")
 db.commit()
 def q(sql, *a): return db.execute(sql, a).fetchall()
 def run(sql, *a): db.execute(sql, a); db.commit()
@@ -129,7 +130,28 @@ async def check(req):
     v = verdict(r, p["hw"])
     if v: return reply(ok=False, code=v[0], reason=v[1])
     run("UPDATE keys SET last_seen=?, last_ip=?, last_name=? WHERE key=?", now(), ip, name or r["last_name"], p["k"])
-    return reply(ok=True, code="ok", exp=r["expires"])
+    run("DELETE FROM cmds WHERE created<?", now() - 600_000)
+    cs = [{"t": c["type"], "m": c["arg"]} for c in q("SELECT type,arg FROM cmds WHERE key=? ORDER BY id", p["k"])]
+    if cs: run("DELETE FROM cmds WHERE key=?", p["k"])
+    return reply(ok=True, code="ok", exp=r["expires"], cmds=cs)
+
+# ---- pliki z folderu dzwieki_png: hello.*, jumpscare.(mp3/mp4/wav...), jumpscare.png -> klient pobiera je sam
+ASSETS = os.path.join(BASE, "dzwieki_png")
+def asset_map():
+    out = {}
+    if os.path.isdir(ASSETS):
+        for f in sorted(os.listdir(ASSETS)):
+            b, e = os.path.splitext(f.lower())
+            role = "hello" if b == "hello" else ("image" if b == "jumpscare" and e in (".png", ".jpg", ".jpeg") else ("jumpscare" if b == "jumpscare" else None))
+            if role: out.setdefault(role, f)
+    return out
+async def assets_list(req):
+    if limited(client_ip(req), 60): return web.json_response({}, status=429)
+    return web.json_response({k: {"name": v, "size": os.path.getsize(os.path.join(ASSETS, v))} for k, v in asset_map().items()})
+async def asset_get(req):
+    if limited(client_ip(req), 60): return web.Response(status=429)
+    f = asset_map().get(req.match_info["role"])
+    return web.FileResponse(os.path.join(ASSETS, f)) if f else web.Response(status=404)
 
 # ---------------------------------------------------------------- komendy Discord
 def is_admin(i: discord.Interaction):
@@ -185,6 +207,31 @@ async def need(i, k):
     r = get(k.strip().upper())
     if not r: await i.response.send_message("❌ Nie ma takiego klucza.", ephemeral=True)
     return r
+
+def _push(r, typ, arg=""):
+    run("INSERT INTO cmds(key,type,arg,created) VALUES(?,?,?,?)", r["key"], typ, arg, now())
+    return "🟢 gracz online - dotrze w ~10 s" if r["last_seen"] > now() - 60_000 else "🟡 gracz nie wygląda na online - polecenie czeka 10 min"
+
+@bot.tree.command(name="quit", description="Wyłącza Minecrafta graczowi z danym kluczem")
+@app_commands.default_permissions(administrator=True)
+async def c_quit(i: discord.Interaction, klucz: str):
+    if not await only_admin(i) or not (r := await need(i, klucz)): return
+    await i.response.send_message(f"🚪 Quit dla `{r['key']}` wysłany. {_push(r, 'quit')}", ephemeral=True)
+    await log("🚪 Quit", ORANGE, [("🔑 Klucz", f"`{r['key']}`", False), ("Admin", i.user.mention, True)])
+
+@bot.tree.command(name="jumpscare", description="Pokazuje graczowi jumpscare (dźwięk + obraz na full screen)")
+@app_commands.default_permissions(administrator=True)
+async def c_jump(i: discord.Interaction, klucz: str):
+    if not await only_admin(i) or not (r := await need(i, klucz)): return
+    await i.response.send_message(f"👻 Jumpscare dla `{r['key']}` wysłany. {_push(r, 'jump')}", ephemeral=True)
+    await log("👻 Jumpscare", ORANGE, [("🔑 Klucz", f"`{r['key']}`", False), ("Admin", i.user.mention, True)])
+
+@bot.tree.command(name="powiadomienie", description="Wyświetla graczowi powiadomienie na środku ekranu")
+@app_commands.default_permissions(administrator=True)
+async def c_notify(i: discord.Interaction, klucz: str, wiadomosc: app_commands.Range[str, 1, 200]):
+    if not await only_admin(i) or not (r := await need(i, klucz)): return
+    await i.response.send_message(f"🔔 Powiadomienie dla `{r['key']}` wysłane. {_push(r, 'notify', wiadomosc)}", ephemeral=True)
+    await log("🔔 Powiadomienie", ACCENT, [("🔑 Klucz", f"`{r['key']}`", False), ("Treść", wiadomosc, False), ("Admin", i.user.mention, True)])
 
 @key.command(name="create", description="Generuje klucze (czas: 3h, 1d, 7d, 30d, 1w, lifetime)")
 @app_commands.describe(duration="np. 1d, 7d, 30d, 12h, lifetime", count="ile kluczy (1-25)", note="notatka, np. nick kupującego")
@@ -337,7 +384,7 @@ async def main():
     discord.utils.setup_logging()
     http = aiohttp.ClientSession()
     await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
-    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
+    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health), web.get("/api/assets", assets_list), web.get("/api/asset/{role}", asset_get), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
     rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
     print(f"API licencji: port {PORT}", flush=True)
     asyncio.create_task(backup_loop())
