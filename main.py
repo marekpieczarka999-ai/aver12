@@ -8,12 +8,17 @@ from cryptography.hazmat.primitives import serialization
 from discord import app_commands
 
 def env_file():
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(p):
-        for l in open(p, encoding="utf-8"):
+    d = os.path.dirname(os.path.abspath(__file__))
+    for n in (".env", ".env.txt", "env", "env.txt"):   # Notepad lubi dopisac .txt
+        p = os.path.join(d, n)
+        if not os.path.exists(p): continue
+        for l in open(p, encoding="utf-8-sig"):   # utf-8-sig: usuwa BOM z Notatnika
             l = l.strip()
+            if l.startswith("export "): l = l[7:]
             if l and not l.startswith("#") and "=" in l:
-                k, v = l.split("=", 1); os.environ.setdefault(k.strip(), v.strip().strip('"'))
+                k, v = l.split("=", 1); k = k.strip(); v = v.strip().strip('"').strip("'")
+                if not os.environ.get(k): os.environ[k] = v   # nadpisz tez puste zmienne
+        print("wczytano", n, flush=True); return
 env_file()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 WEBHOOK = os.getenv("WEBHOOK_URL", "")
