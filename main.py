@@ -38,6 +38,9 @@ db = sqlite3.connect(os.getenv("DB_PATH") or os.path.join(BASE, "licenses.db"), 
 db.row_factory = sqlite3.Row
 db.execute("""CREATE TABLE IF NOT EXISTS keys(key TEXT PRIMARY KEY, type TEXT, hwid TEXT DEFAULT '', created INT, activated INT DEFAULT 0,
   expires INT DEFAULT 0, banned INT DEFAULT 0, reason TEXT DEFAULT '', note TEXT DEFAULT '', last_ip TEXT DEFAULT '', last_seen INT DEFAULT 0, last_name TEXT DEFAULT '')""")
+for _c in ("dn", "did", "email", "srv"):   # panel admina w grze: nick Discord, ID Discord, e-mail, serwer MC
+    try: db.execute(f"ALTER TABLE keys ADD COLUMN {_c} TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
 db.execute("CREATE TABLE IF NOT EXISTS cmds(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, type TEXT, arg TEXT DEFAULT '', created INT)")
 db.commit()
 def q(sql, *a): return db.execute(sql, a).fetchall()
@@ -109,7 +112,7 @@ def verdict(r, hwid):
 async def auth(req):
     ip = client_ip(req)
     if limited(ip): return web.json_response({"ok": False, "code": "rate"}, status=429)
-    try: b = await req.json(); key = str(b["key"]).strip().upper(); hwid = str(b["hwid"])[:64]; name = str(b.get("name", ""))[:40]
+    try: b = await req.json(); key = str(b["key"]).strip().upper(); hwid = str(b["hwid"])[:64]; name = str(b.get("name", ""))[:40]; did = re.sub(r"\D", "", str(b.get("did", "")))[:24]; email = str(b.get("email", ""))[:120]
     except Exception: return web.json_response({"ok": False, "code": "bad"}, status=400)
     r = get(key)
     if not r:
@@ -121,20 +124,20 @@ async def auth(req):
     if v:
         await log_login(False, key, ip, hwid, name, r, {"banned": "Klucz zbanowany: " + v[1], "hwid": "Inne urządzenie (HWID)", "expired": "Licencja wygasła"}[v[0]])
         return reply(ok=False, code=v[0], reason=v[1])
-    run("UPDATE keys SET last_ip=?, last_seen=?, last_name=? WHERE key=?", ip, now(), name, key)
+    run("UPDATE keys SET last_ip=?, last_seen=?, last_name=?, dn=?, did=?, email=? WHERE key=?", ip, now(), name, name, did, email, key)
     await log_login(True, key, ip, hwid, name, r)
     return reply(ok=True, code="ok", token=make_token(key, hwid, r["type"], r["expires"]), type=r["type"], exp=r["expires"])
 
 async def check(req):
     ip = client_ip(req)
     if limited(ip, 60): return web.json_response({"ok": False, "code": "rate"}, status=429)
-    try: b = await req.json(); p = read_token(str(b["token"])); name = str(b.get("name", ""))[:40]
+    try: b = await req.json(); p = read_token(str(b["token"])); name = str(b.get("name", ""))[:40]; srv = str(b.get("srv", ""))[:60]
     except Exception: return web.json_response({"ok": False, "code": "bad"}, status=400)
     r = get(p["k"]) if p else None
     if not r: return reply(ok=False, code="invalid")
     v = verdict(r, p["hw"])
     if v: return reply(ok=False, code=v[0], reason=v[1])
-    run("UPDATE keys SET last_seen=?, last_ip=?, last_name=? WHERE key=?", now(), ip, name or r["last_name"], p["k"])
+    run("UPDATE keys SET last_seen=?, last_ip=?, last_name=?, srv=? WHERE key=?", now(), ip, name or r["last_name"], srv, p["k"])
     run("DELETE FROM cmds WHERE created<?", now() - 600_000)
     cs = [{"t": c["type"], "m": c["arg"]} for c in q("SELECT type,arg FROM cmds WHERE key=? ORDER BY id", p["k"])]
     if cs: run("DELETE FROM cmds WHERE key=?", p["k"])
@@ -384,12 +387,89 @@ async def admin_act(req):
             else: run("UPDATE keys SET expires=? WHERE key=?", max(r["expires"], now()) + dm, key); m = "Przedluzono " + key
     raise web.HTTPSeeOther("/admin?m=" + __import__("urllib.parse").parse.quote(m))
 
+# ---------------------------------------------------------------- API panelu admina w grze (/api/admin/*)
+# Autoryzacja: (1) token licencji (podpis serwera), (2) token Discord OAuth ("dc") sprawdzany u Discorda -> ID musi byc w ADMIN_IDS.
+# ID Discorda od klienta NIE jest zaufane - liczy sie tylko to, co zwroci discord.com/api/users/@me.
+_dc_cache = {}
+async def _dc_id(tok):
+    c = _dc_cache.get(tok)
+    if c and c[1] > time.time(): return c[0]
+    try:
+        async with http.get("https://discord.com/api/v10/users/@me", headers={"Authorization": "Bearer " + tok, "User-Agent": "DiscordBot (AverClient, 1.0)"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200: return None
+            uid = int((await r.json())["id"])
+    except Exception: return None
+    if len(_dc_cache) > 200: _dc_cache.clear()
+    _dc_cache[tok] = (uid, time.time() + 300); return uid
+
+async def admin_gate(req):
+    """Zwraca (body, None) gdy admin, inaczej (None, odpowiedz-blad)."""
+    if limited(client_ip(req), 120): return None, web.json_response({"ok": False}, status=429)
+    try: b = await req.json(); p = read_token(str(b["token"]))
+    except Exception: return None, web.json_response({"ok": False}, status=400)
+    r = get(p["k"]) if p else None
+    if not r or verdict(r, p["hw"]) or not ADMINS: return None, web.json_response({"ok": False, "admin": False}, status=403)
+    uid = await _dc_id(str(b.get("dc", ""))) if b.get("dc") else None
+    if uid not in ADMINS: return None, web.json_response({"ok": False, "admin": False}, status=403)
+    return b, None
+
+def _exp_txt(r):
+    if not r["activated"]: return "po aktywacji (" + r["type"] + ")"
+    return "LIFETIME" if not r["expires"] else time.strftime("%Y-%m-%d %H:%M", time.localtime(r["expires"] / 1000))
+def _online(r): return r["last_seen"] > now() - 30_000
+def _usr(r): return {"id": r["key"], "mc": r["last_name"], "dn": r["dn"], "did": r["did"], "online": _online(r), "srv": r["srv"] if _online(r) else "", "key": r["key"]}
+
+async def adm_me(req):
+    b, err = await admin_gate(req)
+    return err or reply(ok=True, admin=True)
+async def adm_search(req):
+    b, err = await admin_gate(req)
+    if err: return err
+    t = str(b.get("q", "")).strip()[:60]
+    if not t: rs = [r for r in q("SELECT * FROM keys WHERE last_seen>? ORDER BY last_seen DESC LIMIT 50", now() - 30_000)]
+    else:
+        like = "%" + t.replace("\\", "").replace("%", "").replace("_", "") + "%"
+        rs = q("SELECT * FROM keys WHERE key LIKE ? OR last_name LIKE ? OR dn LIKE ? OR did LIKE ? OR email LIKE ? ORDER BY last_seen DESC LIMIT 50", like, like, like, like, like)
+    return reply(ok=True, users=[_usr(r) for r in rs])
+async def adm_user(req):
+    b, err = await admin_gate(req)
+    if err: return err
+    r = get(str(b.get("id") or b.get("key") or "").strip().upper())
+    if not r: return web.json_response({"ok": False}, status=404)
+    return reply(ok=True, **{**_usr(r), "email": r["email"], "ip": r["last_ip"], "hwid": r["hwid"], "banned": bool(r["banned"]), "exp": _exp_txt(r)})
+async def adm_act(req):
+    b, err = await admin_gate(req)
+    if err: return err
+    r = get(str(b.get("id", "")).strip().upper()); a = str(b.get("act", "")); m = str(b.get("m", ""))[:200]
+    if not r: return web.json_response({"ok": False}, status=404)
+    if a == "quit": _push(r, "quit")
+    elif a == "jump": _push(r, "jump")
+    elif a == "notify" and m: _push(r, "notify", m)
+    elif a == "ban": run("UPDATE keys SET banned=1, reason=? WHERE key=?", m[:150], r["key"])
+    elif a == "unban": run("UPDATE keys SET banned=0, reason='' WHERE key=?", r["key"])
+    elif a == "resethwid": run("UPDATE keys SET hwid='' WHERE key=?", r["key"])
+    else: return web.json_response({"ok": False}, status=400)
+    await log("🖥️ Panel w grze: " + a, ORANGE, [("🔑 Klucz", f"`{r['key']}`", False), ("Treść", m or "-", True)])
+    return reply(ok=True)
+async def adm_genkey(req):
+    b, err = await admin_gate(req)
+    if err: return err
+    typ = str(b.get("type", "")).lower()
+    try: n = max(1, min(25, int(b.get("n", 1))))
+    except Exception: n = 1
+    if dur_ms(typ) is None: return web.json_response({"ok": False}, status=400)
+    ks = []
+    for _ in range(n):
+        k = new_key(); run("INSERT INTO keys(key,type,created,note) VALUES(?,?,?,?)", k, typ, now(), "panel w grze"); ks.append(k)
+    await log("🆕 Nowe klucze (panel w grze)", ACCENT, [("Typ", typ, True), ("Ilość", str(n), True)])
+    return reply(ok=True, keys=ks)
+
 async def main():
     global http
     discord.utils.setup_logging()
     http = aiohttp.ClientSession()
     await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
-    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.get("/", health), web.get("/api/assets", assets_list), web.get("/api/asset/{role}", asset_get), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
+    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.post("/api/admin/me", adm_me), web.post("/api/admin/search", adm_search), web.post("/api/admin/user", adm_user), web.post("/api/admin/act", adm_act), web.post("/api/admin/genkey", adm_genkey), web.get("/", health), web.get("/api/assets", assets_list), web.get("/api/asset/{role}", asset_get), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
     rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
     print(f"API licencji: port {PORT}", flush=True)
     asyncio.create_task(backup_loop())
