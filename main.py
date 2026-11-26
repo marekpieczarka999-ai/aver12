@@ -1,4 +1,4 @@
-"""Aver Client - bot Discord + serwer licencji (jeden proces, hostowany 24/7).
+"""Xairo Client - bot Discord + serwer licencji (jeden proces, hostowany 24/7).
 Start: pip install -r requirements.txt ; skopiuj .env.example -> .env, uzupelnij ; python bot.py"""
 import asyncio, base64, hashlib, json, os, re, secrets, sqlite3, time
 from collections import defaultdict, deque
@@ -78,8 +78,8 @@ http = None
 async def log(title, color, fields, desc=""):
     if not WEBHOOK or not http: return
     e = {"title": title, "color": color, "description": desc, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-         "fields": [{"name": n, "value": v or "-", "inline": i} for n, v, i in fields], "footer": {"text": "Aver Client • licencje"}}
-    try: await http.post(WEBHOOK, json={"username": "Aver Licenses", "embeds": [e]}, timeout=aiohttp.ClientTimeout(total=10))
+         "fields": [{"name": n, "value": v or "-", "inline": i} for n, v, i in fields], "footer": {"text": "Xairo Client • licencje"}}
+    try: await http.post(WEBHOOK, json={"username": "Xairo Licenses", "embeds": [e]}, timeout=aiohttp.ClientTimeout(total=10))
     except Exception as ex: print("webhook error:", ex)
 def ts(ms, st="F"): return f"<t:{ms // 1000}:{st}>" if ms else "nigdy (lifetime)"
 def tag(r): return "Lifetime" if not r["expires"] else r["type"]
@@ -354,8 +354,8 @@ async def admin_page(req):
         rows += (f"<tr><td><code>{k}</code></td><td>{_h.escape(r['type'])}</td><td>{st}</td><td>{exp}</td><td>{_h.escape(r['last_name'] or '-')}</td><td>{_h.escape(r['note'] or '')}</td><td>"
                  + f("unban" if r["banned"] else "ban", "Odbanuj" if r["banned"] else "Banuj", '' if r["banned"] else ' <input name=arg placeholder=powod size=10>')
                  + f("extend", "+czas", ' <input name=arg placeholder=7d size=4>') + f("resethwid", "Reset HWID") + f("delete", "Usun") + "</td></tr>")
-    page = f"""<!doctype html><meta charset=utf-8><title>Aver panel</title><style>body{{font:14px system-ui;background:#0b0b0d;color:#eee;padding:20px}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #222;padding:6px;text-align:left}}button,input{{background:#1b1b20;color:#eee;border:1px solid #333;border-radius:6px;padding:4px 8px}}code{{color:#6cb6ff}}</style>
-<h2>Aver - klucze</h2><p style=color:#3dd68c>{msg}</p>
+    page = f"""<!doctype html><meta charset=utf-8><title>Xairo panel</title><style>body{{font:14px system-ui;background:#0b0b0d;color:#eee;padding:20px}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #222;padding:6px;text-align:left}}button,input{{background:#1b1b20;color:#eee;border:1px solid #333;border-radius:6px;padding:4px 8px}}code{{color:#6cb6ff}}</style>
+<h2>Xairo - klucze</h2><p style=color:#3dd68c>{msg}</p>
 <form method=post action="/admin/act"><input type=hidden name=csrf value="{CSRF}"><input type=hidden name=a value=create>
 Czas <input name=arg value=30d size=8> Ilosc <input name=count value=1 size=3 type=number min=1 max=25> Notatka <input name=note> <button>Generuj klucze</button></form><br>
 <table><tr><th>Klucz<th>Typ<th>Status<th>Wygasa<th>Nick<th>Notatka<th>Akcje</tr>{rows}</table>"""
@@ -469,7 +469,7 @@ async def main():
     discord.utils.setup_logging()
     http = aiohttp.ClientSession()
     await restore()                                   # najpierw baza, potem API (inaczej klienci dostaliby "invalid")
-    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.post("/api/admin/me", adm_me), web.post("/api/admin/search", adm_search), web.post("/api/admin/user", adm_user), web.post("/api/admin/act", adm_act), web.post("/api/admin/genkey", adm_genkey), web.get("/", health), web.get("/api/assets", assets_list), web.get("/api/asset/{role}", asset_get), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
+    app = web.Application(); app.add_routes([web.post("/api/auth", auth), web.post("/api/check", check), web.post("/api/admin/me", adm_me), web.post("/api/admin/search", adm_search), web.post("/api/admin/user", adm_user), web.post("/api/admin/act", adm_act), web.post("/api/admin/genkey", adm_genkey), web.get("/", health), web.get("/health", health), web.get("/api/assets", assets_list), web.get("/api/asset/{role}", asset_get), web.get("/admin", admin_page), web.post("/admin/act", admin_act)])
     rn = web.AppRunner(app); await rn.setup(); await web.TCPSite(rn, "0.0.0.0", PORT).start()
     print(f"API licencji: port {PORT}", flush=True)
     asyncio.create_task(backup_loop())
