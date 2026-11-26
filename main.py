@@ -41,6 +41,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS keys(key TEXT PRIMARY KEY, type TEXT, h
 for _c in ("dn", "did", "email", "srv"):   # panel admina w grze: nick Discord, ID Discord, e-mail, serwer MC
     try: db.execute(f"ALTER TABLE keys ADD COLUMN {_c} TEXT DEFAULT ''")
     except sqlite3.OperationalError: pass
+try: db.execute("ALTER TABLE keys ADD COLUMN unlink INT DEFAULT 0")   # 1 = admin odlaczyl klucz (/rozłącz): launcher ma go zapomniec, gracz wpisuje go od nowa
+except sqlite3.OperationalError: pass
 db.execute("CREATE TABLE IF NOT EXISTS cmds(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, type TEXT, arg TEXT DEFAULT '', created INT)")
 db.commit()
 def q(sql, *a): return db.execute(sql, a).fetchall()
@@ -112,7 +114,7 @@ def verdict(r, hwid):
 async def auth(req):
     ip = client_ip(req)
     if limited(ip): return web.json_response({"ok": False, "code": "rate"}, status=429)
-    try: b = await req.json(); key = str(b["key"]).strip().upper(); hwid = str(b["hwid"])[:64]; name = str(b.get("name", ""))[:40]; did = re.sub(r"\D", "", str(b.get("did", "")))[:24]; email = str(b.get("email", ""))[:120]
+    try: b = await req.json(); key = str(b["key"]).strip().upper(); hwid = str(b["hwid"])[:64]; name = str(b.get("name", ""))[:40]; did = re.sub(r"\D", "", str(b.get("did", "")))[:24]; email = str(b.get("email", ""))[:120]; saved = b.get("saved")   # True = klucz z zapisanego pliku / trwajacej sesji launchera, False = gracz wpisal go recznie, brak pola = stary launcher
     except Exception: return web.json_response({"ok": False, "code": "bad"}, status=400)
     r = get(key)
     if not r:
@@ -124,6 +126,11 @@ async def auth(req):
     if v:
         await log_login(False, key, ip, hwid, name, r, {"banned": "Klucz zbanowany: " + v[1], "hwid": "Inne urządzenie (HWID)", "expired": "Licencja wygasła"}[v[0]])
         return reply(ok=False, code=v[0], reason=v[1])
+    if r["unlink"]:   # /rozłącz: sygnal jednorazowy - launcher kasuje zapisany klucz i prosi o wpisanie go od nowa
+        run("UPDATE keys SET unlink=0 WHERE key=?", key)
+        if saved is not False:   # start z zapisanym kluczem / odpytywanie w tle / stary launcher (bez pola); reczne wpisanie klucza (False) przechodzi normalnie
+            await log("🔌 Klucz odłączony od launchera", ORANGE, [("🔑 Klucz", f"`{key}`", False), ("🌐 IP", f"`{ip}`", True), ("👤 Nick", name or "-", True)])
+            return reply(ok=False, code="unlinked")
     run("UPDATE keys SET last_ip=?, last_seen=?, last_name=?, dn=?, did=?, email=? WHERE key=?", ip, now(), name, name, did, email, key)
     await log_login(True, key, ip, hwid, name, r)
     return reply(ok=True, code="ok", token=make_token(key, hwid, r["type"], r["expires"]), type=r["type"], exp=r["expires"])
@@ -137,6 +144,7 @@ async def check(req):
     if not r: return reply(ok=False, code="invalid")
     v = verdict(r, p["hw"])
     if v: return reply(ok=False, code=v[0], reason=v[1])
+    if r["unlink"]: return reply(ok=False, code="unlinked")   # /rozłącz: gra tez sie zamyka (flage zdejmuje dopiero launcher przy /api/auth)
     run("UPDATE keys SET last_seen=?, last_ip=?, last_name=?, srv=? WHERE key=?", now(), ip, name or r["last_name"], srv, p["k"])
     run("DELETE FROM cmds WHERE created<?", now() - 600_000)
     cs = [{"t": c["type"], "m": c["arg"]} for c in q("SELECT type,arg FROM cmds WHERE key=? ORDER BY id", p["k"])]
@@ -176,6 +184,7 @@ def card(r):
     e.add_field(name="HWID", value=f"`{r['hwid'][:12]}…`" if r["hwid"] else "-"); e.add_field(name="Ostatnie IP", value=f"`{r['last_ip'] or '-'}`")
     e.add_field(name="Ostatnio", value=ts(r["last_seen"], "R") if r["last_seen"] else "-"); e.add_field(name="Nick", value=r["last_name"] or "-")
     if r["banned"]: e.add_field(name="Powód bana", value=r["reason"] or "-", inline=False)
+    if r["unlink"]: e.add_field(name="Odłączenie", value="🔌 oczekuje - gracz musi wpisać klucz od nowa", inline=False)
     if r["note"]: e.add_field(name="Notatka", value=r["note"], inline=False)
     return e
 
@@ -240,6 +249,17 @@ async def c_notify(i: discord.Interaction, klucz: str, wiadomosc: app_commands.R
     if not await only_admin(i) or not (r := await need(i, klucz)): return
     await i.response.send_message(f"🔔 Powiadomienie dla `{r['key']}` wysłane. {_push(r, 'notify', wiadomosc)}", ephemeral=True)
     await log("🔔 Powiadomienie", ACCENT, [("🔑 Klucz", f"`{r['key']}`", False), ("Treść", wiadomosc, False), ("Admin", i.user.mention, True)])
+
+@bot.tree.command(name="rozłącz", description="Odłącza klucz od launchera gracza - musi wpisać go od nowa (bez bana)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(klucz="klucz, który ma zniknąć z launchera gracza")
+async def c_unlink(i: discord.Interaction, klucz: str):
+    if not await only_admin(i) or not (r := await need(i, klucz)): return
+    if not r["activated"]: return await i.response.send_message(f"ℹ️ `{r['key']}` nie był jeszcze aktywowany - nie ma czego odłączać.", ephemeral=True)
+    run("UPDATE keys SET unlink=1 WHERE key=?", r["key"])
+    on = r["last_seen"] > now() - 60_000
+    await i.response.send_message(f"🔌 Odłączono `{r['key']}` od launchera. " + ("🟢 gracz online - launcher i gra zamkną się w ~20 s, a klucz zniknie z launchera." if on else "🟡 gracz nie wygląda na online - klucz zniknie z launchera przy jego następnym uruchomieniu."), ephemeral=True)
+    await log("🔌 Rozłączenie klucza", ORANGE, [("🔑 Klucz", f"`{r['key']}`", False), ("Admin", i.user.mention, True)])
 
 @key.command(name="create", description="Generuje klucze (czas: 3h, 1d, 7d, 30d, 1w, lifetime)")
 @app_commands.describe(duration="np. 1d, 7d, 30d, 12h, lifetime", count="ile kluczy (1-25)", note="notatka, np. nick kupującego")
